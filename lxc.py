@@ -1,55 +1,26 @@
 from __future__ import absolute_import
 
-import distutils.spawn
-import os,sys
+import os, sys
 import subprocess
 import shutil
 import traceback
-import re
+import select
 from ansible import errors
 from ansible.callbacks import vvv
-
-try:  # py3
-    from shlex import quote
-except ImportError:  # py2
-    from pipes import quote
 
 import lxc as _lxc
 
 class Connection(object):
     """ Local lxc based connections """
 
-    def _search_executable(self, executable):
-        cmd = distutils.spawn.find_executable(executable)
-        if not cmd:
-            raise errors.AnsibleError("%s command not found in PATH") % executable
-        return cmd
-
-    def _root_fs(self):
-        rootfs = self.container.get_running_config_item("lxc.rootfs")
-        # overlayfs use the scheme:
-        #   overlayfs:/var/lib/lxc/LXC-Template-1404/rootfs:/var/lib/lxc/lxc-demo/delta0
-        match = re.match(r'^overlayfs:.+?rootfs:(.+)', rootfs)
-        if match:
-            rootfs = match.group(1)
-        if not rootfs:
-            raise errors.AnsibleError("rootfs not set in configuration for %s") % self.host
-        return rootfs
-
     def __init__(self, runner, host, port, *args, **kwargs):
         self.has_pipelining = False
         self.host = host
-        # port is unused, since this is local
-        self.port = port
         self.runner = runner
-
-        self.lxc_attach = self._search_executable("lxc-attach")
 
         self.container = _lxc.Container(host)
         if self.container.state == "STOPPED":
             raise errors.AnsibleError("%s is not running" % host)
-
-        self.rootfs = self._root_fs()
 
     def connect(self, port=None):
         """ connect to the lxc; nothing to do here """
@@ -58,61 +29,86 @@ class Connection(object):
 
         return self
 
-    def _generate_cmd(self, executable, cmd):
-        if executable:
-            return [self.lxc_attach, "--name", self.host, "--", executable, "-c", cmd]
-        else:
-            return "%s --name %s -- %s" % (self.lxc_attach, quote(self.host), cmd)
-
     def exec_command(self, cmd, tmp_path, sudo_user=None, become_user=None, sudoable=False, executable="/bin/sh", in_data=None, su=None, su_user=None):
         """ run a command on the chroot """
 
+        local_cmd = [cmd]
+        if executable:
+            local_cmd = [executable, "-c"] + local_cmd
         if sudo_user:
-            cmd = 'sudo -u "%s" -- %s' % (sudo_user, cmd)
-            
-        local_cmd = self._generate_cmd(executable, cmd)
+            local_cmd = ["sudo", "-u", sudo_user, "--"] + local_cmd
+
+        read_stdout, write_stdout = os.pipe()
+        read_stderr, write_stderr = os.pipe()
 
         vvv("EXEC %s" % (local_cmd), host=self.host)
-        p = subprocess.Popen(local_cmd, shell=isinstance(local_cmd, basestring),
-                        cwd=self.runner.basedir,
-                        stdin=subprocess.PIPE,
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = p.communicate()
-        return (p.returncode, "", stdout, stderr)
 
-    def _normalize_path(self, path, prefix):
-        if not path.startswith(os.path.sep):
-            path = os.path.join(os.path.sep, path)
-        normpath = os.path.normpath(path)
-        return os.path.join(prefix, normpath[1:])
+        pid = self.container.attach(_lxc.attach_run_command, local_cmd,
+                stdout=write_stdout,
+                stderr=write_stderr)
+        os.close(write_stdout)
+        os.close(write_stderr)
+        fds = [read_stdout, read_stderr]
 
-    def _copy(self, in_path, out_path):
-        if not os.path.exists(in_path):
-            raise errors.AnsibleFileNotFound("file or module does not exist: %s" % in_path)
-        try:
-            shutil.copyfile(in_path, out_path)
-        except shutil.Error:
-            traceback.print_exc()
-            raise errors.AnsibleError("failed to copy: %s and %s are the same" % (in_path, out_path))
-        except IOError:
-            traceback.print_exc()
-            raise errors.AnsibleError("failed to transfer file to %s" % out_path)
+        buf = { read_stdout: [], read_stderr: [] }
+        while len(fds) > 0:
+            ready_fds, _, _ = select.select(fds, [], [])
+            for fd in ready_fds:
+              data = os.read(fd, 32768)
+              if not data:
+                  fds.remove(fd)
+                  os.close(fd)
+              buf[fd].append(data)
+
+        (pid, returncode) = os.waitpid(pid, 0)
+
+        stdout = b"".join(buf[read_stdout])
+        stderr = b"".join(buf[read_stderr])
+
+        return (returncode, "", stdout, stderr)
 
     def put_file(self, in_path, out_path):
         """ transfer a file from local to lxc """
 
-        out_path = self._normalize_path(out_path, self.rootfs)
-
         vvv("PUT %s TO %s" % (in_path, out_path), host=self.host)
-        self._copy(in_path, out_path)
+        if not os.path.exists(in_path):
+            raise errors.AnsibleFileNotFound("file or module does not exist: %s" % in_path)
+        try:
+            src_file = open(in_path, "rb")
+        except IOError:
+            traceback.print_exc()
+            raise errors.AnsibleError("failed to open file to %s" % in_path)
+
+        def write_file(args):
+            dst_file = open(out_path, 'wb')
+            shutil.copyfileobj(src_file, dst_file)
+        try:
+            self.container.attach_wait(write_file, None)
+        except IOError:
+            traceback.print_exc()
+            raise errors.AnsibleError("failed to transfer file to %s" % out_path)
 
     def fetch_file(self, in_path, out_path):
         """ fetch a file from lxc to local """
 
-        in_path = self._normalize_path(in_path, self.rootfs)
-
         vvv("FETCH %s TO %s" % (in_path, out_path), host=self.host)
-        self._copy(in_path, out_path)
+        if not os.path.exists(in_path):
+            raise errors.AnsibleFileNotFound("file or module does not exist: %s" % in_path)
+
+        try:
+            dst_file = open(out_path, "wb")
+        except IOError:
+            traceback.print_exc()
+            raise errors.AnsibleError("failed to write to file %s" % out_path)
+
+        def write_file(args):
+            src_file = open(in_path, 'rb')
+            shutil.copyfileobj(src_file, dst_file)
+        try:
+            self.container.attach_wait(write_file, None)
+        except IOError:
+            traceback.print_exc()
+            raise errors.AnsibleError("failed to transfer file from %s to %s" % (in_path, out_path))
 
     def close(self):
         """ terminate the connection; nothing to do here """
